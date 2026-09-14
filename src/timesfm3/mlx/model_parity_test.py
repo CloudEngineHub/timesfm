@@ -69,6 +69,11 @@ def _build_torch_model(
   use_stitching: bool = True,
   use_iterative_cpm_revin: bool = True,
   activation: str = "relu",
+  ff_activation: str = "relu",
+  v_norm: str = "none",
+  causal_attention: bool = True,
+  use_rope_var: bool = False,
+  use_memory_efficient_attention: bool = True,
   seed: int = 0,
 ):
   import torch
@@ -93,12 +98,15 @@ def _build_torch_model(
       attention_norm="rms",
       feedforward_norm="rms",
       qk_norm="rms",
+      v_norm=v_norm,
       use_rope_seq=True,
-      use_rope_var=False,
+      use_rope_var=use_rope_var,
       use_bias=False,
-      ff_activation="relu",
+      ff_activation=ff_activation,
       deterministic=True,
       use_sdpa=True,
+      causal_attention=causal_attention,
+      use_memory_efficient_attention=use_memory_efficient_attention,
     ),
   )
   model = torch_model_lib.TimesFM3Torch(
@@ -121,6 +129,11 @@ def _build_mlx_model(
   use_stitching: bool = True,
   use_iterative_cpm_revin: bool = True,
   residual_activation: str = "relu",
+  ff_activation: str = "relu",
+  v_norm: str = "none",
+  causal_attention: bool = True,
+  use_rope_var: bool = False,
+  use_memory_efficient_attention: bool = True,
 ) -> "mlx_model_lib.TimesFM3Mlx":
   cfg = mlx_configs.TimesFM3MlxConfig(
     input_patch_len=_INPUT_PATCH_LEN,
@@ -137,6 +150,11 @@ def _build_mlx_model(
     value_clip=1e20,
     use_iterative_cpm_revin=use_iterative_cpm_revin,
     residual_activation=residual_activation,
+    ff_activation=ff_activation,
+    v_norm=v_norm,
+    causal_attention=causal_attention,
+    use_rope_var=use_rope_var,
+    use_memory_efficient_attention=use_memory_efficient_attention,
   )
   return mlx_model_lib.TimesFM3Mlx(cfg, compile=False)
 
@@ -160,6 +178,11 @@ def _build_pair(**torch_kwargs):
     use_stitching=torch_kwargs.get("use_stitching", True),
     use_iterative_cpm_revin=torch_kwargs.get("use_iterative_cpm_revin", True),
     residual_activation=torch_kwargs.get("activation", "relu"),
+    ff_activation=torch_kwargs.get("ff_activation", "relu"),
+    v_norm=torch_kwargs.get("v_norm", "none"),
+    causal_attention=torch_kwargs.get("causal_attention", True),
+    use_rope_var=torch_kwargs.get("use_rope_var", False),
+    use_memory_efficient_attention=torch_kwargs.get("use_memory_efficient_attention", True),
   )
   _transplant(torch_model, mlx_model)
   return torch_model, mlx_model
@@ -211,7 +234,7 @@ class TimesFM3ParityTest(unittest.TestCase):
 @unittest.skipUnless(_torch_available(), "requires torch as the parity oracle")
 class TimesFM3KnownDivergenceTest(unittest.TestCase):
   """Regression tests for specific MLX/PyTorch numerical divergences found during review, now
-  fixed in the MLX backend (mlx/model.py, mlx/dense.py, mlx/configs.py).
+  fixed in the MLX backend.
   """
 
   def test_use_stitching_false_is_ignored_by_mlx(self):
@@ -245,6 +268,47 @@ class TimesFM3KnownDivergenceTest(unittest.TestCase):
     ctx[0, 0, 50] = np.nan
     torch_out, mlx_out = _decode_both(torch_model, mlx_model, ctx, horizon=24)
     self.assertFalse(np.isnan(mlx_out).any(), "mlx output contains NaN where torch's does not")
+    np.testing.assert_allclose(torch_out, mlx_out, atol=1e-4)
+
+  def test_ff_activation_is_ignored_by_mlx(self):
+    # mlx/transformer.py's MixingTransformer reads its FFN activation from
+    # TimesFM3MlxConfig.ff_activation, matching torch's TransformerConfig.ff_activation.
+    torch_model, mlx_model = _build_pair(ff_activation="swish")
+    ctx = np.random.RandomState(0).randn(1, 1, 128).astype(np.float32)
+    torch_out, mlx_out = _decode_both(torch_model, mlx_model, ctx, horizon=24)
+    np.testing.assert_allclose(torch_out, mlx_out, atol=1e-4)
+
+  def test_v_norm_is_not_implemented_by_mlx(self):
+    # mlx/transformer.py's MultiHeadAttention applies value normalization when
+    # cfg.v_norm == "rms", including through the single-variate (n==1) attention shortcut.
+    torch_model, mlx_model = _build_pair(v_norm="rms")
+    ctx = np.random.RandomState(0).randn(1, 1, 128).astype(np.float32)
+    torch_out, mlx_out = _decode_both(torch_model, mlx_model, ctx, horizon=24)
+    np.testing.assert_allclose(torch_out, mlx_out, atol=1e-4)
+
+  def test_causal_attention_false_is_ignored_by_mlx(self):
+    # mlx/transformer.py's sequence attention reads causality from cfg.causal_attention instead
+    # of always being causal.
+    torch_model, mlx_model = _build_pair(causal_attention=False)
+    ctx = np.random.RandomState(0).randn(1, 1, 128).astype(np.float32)
+    torch_out, mlx_out = _decode_both(torch_model, mlx_model, ctx, horizon=24)
+    np.testing.assert_allclose(torch_out, mlx_out, atol=1e-4)
+
+  def test_use_memory_efficient_attention_false_is_ignored_by_mlx(self):
+    # mlx/transformer.py's attention logit scale follows cfg.use_memory_efficient_attention
+    # instead of always assuming it's True.
+    torch_model, mlx_model = _build_pair(use_memory_efficient_attention=False)
+    ctx = np.random.RandomState(0).randn(1, 1, 128).astype(np.float32)
+    torch_out, mlx_out = _decode_both(torch_model, mlx_model, ctx, horizon=24)
+    np.testing.assert_allclose(torch_out, mlx_out, atol=1e-4)
+
+  def test_use_rope_var_true_is_ignored_by_mlx(self):
+    # mlx/transformer.py's variate attention reads its RoPE flag from cfg.use_rope_var. A
+    # 1-variate context can't detect this: softmax over a single key is always 1.0 regardless of
+    # RoPE, so this needs >=2 variates to actually exercise variate attention.
+    torch_model, mlx_model = _build_pair(use_rope_var=True)
+    ctx = np.random.RandomState(2).randn(1, 2, 128).astype(np.float32)
+    torch_out, mlx_out = _decode_both(torch_model, mlx_model, ctx, horizon=24)
     np.testing.assert_allclose(torch_out, mlx_out, atol=1e-4)
 
 
