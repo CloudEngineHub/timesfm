@@ -24,6 +24,7 @@ from . import normalization
 _ACTIVATIONS = {
   "relu": nn.relu,
   "swish": nn.silu,
+  "silu": nn.silu,
   "none": lambda x: x,
 }
 

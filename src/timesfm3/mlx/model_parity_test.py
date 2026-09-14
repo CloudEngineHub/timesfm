@@ -252,6 +252,35 @@ class TimesFM3KnownDivergenceTest(unittest.TestCase):
     torch_out, mlx_out = _decode_both(torch_model, mlx_model, ctx, horizon=24)
     np.testing.assert_allclose(torch_out, mlx_out, atol=1e-4)
 
+  def test_use_iterative_cpm_revin_long_horizon(self):
+    # horizon=24 above only exercises one block_offset wraparound (rolls=2). A longer horizon
+    # forces cpm_iterative_revin_refine through multiple wraps, accumulating anchor predictions
+    # across consecutive rolled steps.
+    for use_cpm in (True, False):
+      torch_model, mlx_model = _build_pair(use_iterative_cpm_revin=use_cpm)
+      ctx = np.random.RandomState(0).randn(1, 1, 128).astype(np.float32)
+      torch_out, mlx_out = _decode_both(torch_model, mlx_model, ctx, horizon=48)
+      np.testing.assert_allclose(torch_out, mlx_out, atol=1e-4)
+
+  def test_use_iterative_cpm_revin_with_covariates(self):
+    # The refine step operates on (b, v, rolls, patch_len) where v mixes targets and covariates;
+    # make sure it agrees with torch when past_only/past_future covariates are present too.
+    rng = np.random.RandomState(42)
+    target = rng.randn(1, 2, 128).astype(np.float32)
+    po = rng.randn(1, 1, 128).astype(np.float32)
+    pf = rng.randn(1, 1, 128 + 32).astype(np.float32)
+    for use_cpm in (True, False):
+      torch_model, mlx_model = _build_pair(use_iterative_cpm_revin=use_cpm)
+      torch_out, mlx_out = _decode_both(
+        torch_model,
+        mlx_model,
+        target,
+        horizon=32,
+        past_only_covariates=po,
+        past_future_covariates=pf,
+      )
+      np.testing.assert_allclose(torch_out, mlx_out, atol=1e-4)
+
   def test_residual_block_activation_is_ignored_by_mlx(self):
     # mlx/dense.py's ResidualBlock reads its activation from
     # TimesFM3MlxConfig.residual_activation, matching torch's ResidualBlockConfig.activation.
